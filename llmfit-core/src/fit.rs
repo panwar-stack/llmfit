@@ -607,8 +607,7 @@ pub fn backend_compatible(model: &LlmModel, system: &SystemSpecs) -> bool {
         // minimum required by the quantization format (e.g. AWQ needs Turing+).
         // ROCm and unrecognized NVIDIA GPUs are assumed compatible.
         if system.backend == GpuBackend::Cuda {
-            if let Some(min_cc) =
-                crate::hardware::quant_min_compute_capability(&model.quantization)
+            if let Some(min_cc) = crate::hardware::quant_min_compute_capability(&model.quantization)
             {
                 if let Some(gpu_name) = &system.gpu_name {
                     if let Some(gpu_cc) = crate::hardware::gpu_compute_capability(gpu_name) {
@@ -1879,13 +1878,11 @@ mod tests {
         assert!(backend_compatible(&model, &t4_sys));
 
         // RTX 3090 is Ampere (cc 8.6) — should work
-        let ampere_sys =
-            test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 3090");
+        let ampere_sys = test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 3090");
         assert!(backend_compatible(&model, &ampere_sys));
 
         // RTX 4090 is Ada Lovelace (cc 8.9) — should work
-        let ada_sys =
-            test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 4090");
+        let ada_sys = test_system_with_gpu(64.0, 24.0, "NVIDIA GeForce RTX 4090");
         assert!(backend_compatible(&model, &ada_sys));
 
         // H100 is Hopper (cc 9.0) — should work
