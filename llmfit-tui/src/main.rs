@@ -1156,9 +1156,7 @@ fn run_recommend(
 
     // Filter by license if specified
     if let Some(ref lic_str) = license {
-        fits.retain(|f| {
-            llmfit_core::models::matches_license_filter(&f.model.license, lic_str)
-        });
+        fits.retain(|f| llmfit_core::models::matches_license_filter(&f.model.license, lic_str));
     }
 
     fits = llmfit_core::fit::rank_models_by_fit(fits);

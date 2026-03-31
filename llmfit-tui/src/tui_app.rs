@@ -699,11 +699,7 @@ impl App {
                     if all_selected || self.licenses.is_empty() {
                         true
                     } else {
-                        let model_lic = fit
-                            .model
-                            .license
-                            .as_deref()
-                            .unwrap_or("Unknown");
+                        let model_lic = fit.model.license.as_deref().unwrap_or("Unknown");
                         self.licenses
                             .iter()
                             .zip(self.selected_licenses.iter())

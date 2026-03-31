@@ -380,9 +380,7 @@ fn filtered_fits(
     }
 
     if let Some(ref lic_str) = query.license {
-        fits.retain(|f| {
-            llmfit_core::models::matches_license_filter(&f.model.license, lic_str)
-        });
+        fits.retain(|f| llmfit_core::models::matches_license_filter(&f.model.license, lic_str));
     }
 
     let include_too_tight = query.include_too_tight.unwrap_or(!top_only);
