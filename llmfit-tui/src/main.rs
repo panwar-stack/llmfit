@@ -438,12 +438,14 @@ AGENT USAGE:
   llmfit recommend --runtime mlx --capability vision
   llmfit recommend --force-runtime llamacpp  # get llama.cpp results on Apple Silicon
   llmfit recommend --license apache-2.0,mit
+  llmfit recommend --output-llamacpp  # include llama.cpp commands in output
 
   JSON output is the default. Fields: { system: {...}, models: [{ name,
   provider, parameter_count, fit_level, run_mode, score, score_components
   { quality, speed, fit, context }, estimated_tps, disk_size_gb,
   memory_required_gb, memory_available_gb, utilization_pct, best_quant,
-  use_case, license, runtime, capabilities }] }")]
+  effective_context_length, use_case, license, runtime, capabilities,
+  llamacpp_command (when --output-llamacpp) }] }")]
     Recommend {
         /// Limit number of recommendations
         #[arg(short = 'n', long, default_value = "5")]
@@ -477,6 +479,10 @@ AGENT USAGE:
         /// Output as JSON (default for recommend)
         #[arg(long, default_value = "true")]
         json: bool,
+
+        /// Include suggested llama.cpp commands in output for llama.cpp-compatible models
+        #[arg(long)]
+        output_llamacpp: bool,
     },
 
     /// Download a GGUF model from HuggingFace for use with llama.cpp
@@ -1181,6 +1187,7 @@ fn run_recommend(
     license: Option<String>,
     json: bool,
     csv: bool,
+    output_llamacpp: bool,
     overrides: &HardwareOverrides,
     context_limit: Option<u32>,
 ) {
@@ -1315,7 +1322,11 @@ fn run_recommend(
     if csv {
         display::display_csv_fits(&fits);
     } else if json {
-        display::display_json_fits(&specs, &fits);
+        if output_llamacpp {
+            display::display_json_fits_with_llamacpp(&specs, &fits);
+        } else {
+            display::display_json_fits(&specs, &fits);
+        }
     } else {
         if !fits.is_empty() {
             specs.display();
@@ -1743,8 +1754,8 @@ fn run_model(model: &str, server: bool, port: u16, ngl: i32, ctx_size: u32) {
                 &ngl.to_string(),
                 "-c",
                 &ctx_size.to_string(),
-            ])
-            .status();
+        ])
+        .status();
 
         match status {
             Ok(s) if !s.success() => {
@@ -1971,6 +1982,7 @@ fn main() {
                 capability,
                 license,
                 json,
+                output_llamacpp,
             } => {
                 run_recommend(
                     limit,
@@ -1982,6 +1994,7 @@ fn main() {
                     license,
                     json,
                     cli.csv,
+                    output_llamacpp,
                     &overrides,
                     context_limit,
                 );
@@ -2114,6 +2127,7 @@ mod tests {
             },
             estimated_tps: 30.0,
             best_quant: "Q4_K_M".to_string(),
+            effective_context_length: 8192,
             use_case: llmfit_core::models::UseCase::General,
             runtime: InferenceRuntime::LlamaCpp,
             installed: false,
