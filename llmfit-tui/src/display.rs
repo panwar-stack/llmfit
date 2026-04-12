@@ -498,6 +498,63 @@ pub fn display_json_fits(specs: &SystemSpecs, fits: &[ModelFit]) {
     );
 }
 
+/// Serialize system specs + model fits to JSON with llama.cpp commands and print to stdout.
+pub fn display_json_fits_with_llamacpp(specs: &SystemSpecs, fits: &[ModelFit]) {
+    use llmfit_core::fit::InferenceRuntime;
+
+    let models: Vec<serde_json::Value> = fits
+        .iter()
+        .map(|fit| {
+            let mut json = fit_to_json(fit);
+
+            // Add llama.cpp command for llama.cpp-compatible models
+            if fit.runtime == InferenceRuntime::LlamaCpp {
+                if let Some(cmd) = generate_llamacpp_command(fit) {
+                    json.as_object_mut().unwrap().insert(
+                        "llamacpp_command".to_string(),
+                        serde_json::Value::String(cmd),
+                    );
+                }
+            }
+
+            json
+        })
+        .collect();
+
+    let output = serde_json::json!({
+        "system": system_json(specs),
+        "models": models,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).expect("JSON serialization failed")
+    );
+}
+
+/// Generate a llama.cpp command string for a model fit.
+fn generate_llamacpp_command(fit: &ModelFit) -> Option<String> {
+    // Get the GGUF source repo if available
+    let repo = fit.model.gguf_sources.first().map(|s| &s.repo);
+
+    let quant = &fit.best_quant;
+    let context = fit.model.context_length;
+
+    // Use the -hf option with HuggingFace repo to let llama-cli handle model
+    // downloading/caching. This avoids path guessing issues and works for both
+    // installed and non-installed models. llama-cli automatically downloads
+    // to its own cache if the model isn't present locally.
+    if let Some(repo) = repo {
+        // Format: llama-cli -hf repo/name:QuantLevel -ngl all -c context -cnv
+        // The :QuantLevel suffix tells llama-cli which quantization file to use
+        Some(format!(
+            "llama-cli -hf {}:{} -ngl all -c {} -cnv",
+            repo, quant, context
+        ))
+    } else {
+        None
+    }
+}
+
 /// Serialize diff output via serde derives (new diff-only path).
 pub fn display_json_diff_fits(specs: &SystemSpecs, fits: &[ModelFit]) {
     #[derive(serde::Serialize)]
