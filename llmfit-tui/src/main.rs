@@ -1,4 +1,6 @@
 mod display;
+mod download_history;
+mod filter_config;
 mod serve_api;
 mod theme;
 mod tui_app;
@@ -26,7 +28,7 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
-const DEFAULT_DASHBOARD_HOST: &str = "0.0.0.0";
+const DEFAULT_DASHBOARD_HOST: &str = "127.0.0.1";
 const DEFAULT_DASHBOARD_PORT: u16 = 8787;
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -50,6 +52,9 @@ enum SortArg {
     /// Use-case grouping
     #[value(alias = "use_case", alias = "usecase")]
     Use,
+    /// Model provider
+    #[value(alias = "prov", alias = "vendor")]
+    Provider,
 }
 
 impl From<SortArg> for SortColumn {
@@ -62,6 +67,7 @@ impl From<SortArg> for SortColumn {
             SortArg::Ctx => SortColumn::Ctx,
             SortArg::Date => SortColumn::ReleaseDate,
             SortArg::Use => SortColumn::UseCase,
+            SortArg::Provider => SortColumn::Provider,
         }
     }
 }
@@ -112,6 +118,10 @@ struct Cli {
     #[arg(short, long)]
     perfect: bool,
 
+    /// Show only models with tool/function-call capability
+    #[arg(long)]
+    tool_use: bool,
+
     /// Limit number of results
     #[arg(short = 'n', long)]
     limit: Option<usize>,
@@ -127,6 +137,10 @@ struct Cli {
     /// Output results as JSON (for tool integration)
     #[arg(long, global = true)]
     json: bool,
+
+    /// Output results as CSV (for spreadsheet / data analysis)
+    #[arg(long, global = true)]
+    csv: bool,
 
     /// Override GPU VRAM size (e.g. "32G", "32000M", "1.5T").
     /// Useful when GPU memory autodetection fails.
@@ -239,6 +253,10 @@ AGENT USAGE:
         /// Show only models that perfectly match recommended specs
         #[arg(short, long)]
         perfect: bool,
+
+        /// Show only models with tool/function-call capability
+        #[arg(long)]
+        tool_use: bool,
 
         /// Limit number of results
         #[arg(short = 'n', long)]
@@ -481,6 +499,7 @@ PRECONDITIONS:
 SIDE EFFECTS:
   Downloads a GGUF file to the local model cache directory
   (~/.cache/llmfit/models/ or platform equivalent).
+  Pass --output-dir to write to a different location (e.g. a shared NFS volume).
 
 EXIT CODES:
   0  Success
@@ -509,6 +528,12 @@ AGENT USAGE:
         /// List available GGUF files in the repo without downloading
         #[arg(long)]
         list: bool,
+
+        /// Override the destination directory for the downloaded GGUF file.
+        /// Defaults to the platform-specific models cache
+        /// (~/.cache/llmfit/models/ or equivalent).
+        #[arg(long, value_name = "PATH")]
+        output_dir: Option<std::path::PathBuf>,
     },
 
     /// Search HuggingFace for GGUF models compatible with llama.cpp
@@ -854,18 +879,33 @@ fn ensure_dashboard_available(
 
 fn run_fit(
     perfect: bool,
+    tool_use: bool,
     limit: Option<usize>,
     sort: SortColumn,
     json: bool,
+    csv: bool,
     overrides: &HardwareOverrides,
     context_limit: Option<u32>,
 ) {
+    use llmfit_core::providers::{
+        self as provs, DockerModelRunnerProvider, LlamaCppProvider, LmStudioProvider, MlxProvider,
+        ModelProvider, OllamaProvider,
+    };
+
     let specs = detect_specs(overrides);
     let db = ModelDatabase::new();
 
-    if !json {
+    if !json && !csv {
         specs.display();
     }
+
+    // Query installed models across local providers so that `fit.installed`
+    // is populated in both text and JSON output — same behaviour as `recommend`.
+    let ollama_installed = OllamaProvider::new().installed_models();
+    let mlx_installed = MlxProvider::new().installed_models();
+    let llamacpp_installed = LlamaCppProvider::new().installed_models();
+    let docker_mr_installed = DockerModelRunnerProvider::new().installed_models();
+    let lmstudio_installed = LmStudioProvider::new().installed_models();
 
     let hidden: usize = db
         .get_all_models()
@@ -877,11 +917,27 @@ fn run_fit(
         .get_all_models()
         .iter()
         .filter(|m| backend_compatible(m, &specs))
-        .map(|m| ModelFit::analyze_with_context_limit(m, &specs, context_limit))
+        .map(|m| {
+            let mut fit = ModelFit::analyze_with_context_limit(m, &specs, context_limit);
+            fit.installed = provs::is_model_installed(&m.name, &ollama_installed)
+                || provs::is_model_installed_mlx(&m.name, &mlx_installed)
+                || provs::is_model_installed_llamacpp(&m.name, &llamacpp_installed)
+                || provs::is_model_installed_docker_mr(&m.name, &docker_mr_installed)
+                || provs::is_model_installed_lmstudio(&m.name, &lmstudio_installed);
+            fit
+        })
         .collect();
 
     if perfect {
         fits.retain(|f| f.fit_level == llmfit_core::fit::FitLevel::Perfect);
+    }
+
+    if tool_use {
+        fits.retain(|f| {
+            f.model
+                .capabilities
+                .contains(&llmfit_core::models::Capability::ToolUse)
+        });
     }
 
     fits = llmfit_core::fit::rank_models_by_fit_opts_col(fits, false, sort);
@@ -890,7 +946,9 @@ fn run_fit(
         fits.truncate(n);
     }
 
-    if json {
+    if csv {
+        display::display_csv_fits(&fits);
+    } else if json {
         display::display_json_fits(&specs, &fits);
     } else {
         if hidden > 0 {
@@ -1128,6 +1186,7 @@ fn run_recommend(
     license: Option<String>,
     json: bool,
     output_llamacpp: bool,
+    csv: bool,
     overrides: &HardwareOverrides,
     context_limit: Option<u32>,
 ) {
@@ -1259,7 +1318,9 @@ fn run_recommend(
     fits = llmfit_core::fit::rank_models_by_fit(fits);
     fits.truncate(limit);
 
-    if json {
+    if csv {
+        display::display_csv_fits(&fits);
+    } else if json {
         if output_llamacpp {
             display::display_json_fits_with_llamacpp(&specs, &fits);
         } else {
@@ -1278,11 +1339,29 @@ fn run_download(
     quant: Option<&str>,
     budget: Option<f64>,
     list_only: bool,
+    output_dir: Option<&std::path::Path>,
     overrides: &HardwareOverrides,
 ) {
     use llmfit_core::providers::LlamaCppProvider;
 
-    let provider = LlamaCppProvider::new();
+    let mut provider = LlamaCppProvider::new();
+    if let Some(dir) = output_dir {
+        if !dir.exists() {
+            eprintln!(
+                "Error: --output-dir '{}' does not exist. Create it first or pass an existing directory.",
+                dir.display()
+            );
+            std::process::exit(1);
+        }
+        if !dir.is_dir() {
+            eprintln!(
+                "Error: --output-dir '{}' is not a directory.",
+                dir.display()
+            );
+            std::process::exit(1);
+        }
+        provider.set_models_dir(dir.to_path_buf());
+    }
 
     // Resolve repo ID: try known mapping, then treat as repo, then search
     let repo_id = if model.contains('/') {
@@ -1816,14 +1895,17 @@ fn main() {
 
             Commands::Fit {
                 perfect,
+                tool_use,
                 limit,
                 sort,
             } => {
                 run_fit(
                     perfect,
+                    tool_use,
                     limit,
                     sort.into(),
                     cli.json,
+                    cli.csv,
                     &overrides,
                     context_limit,
                 );
@@ -1911,6 +1993,7 @@ fn main() {
                     license,
                     json,
                     output_llamacpp,
+                    cli.csv,
                     &overrides,
                     context_limit,
                 );
@@ -1921,8 +2004,16 @@ fn main() {
                 quant,
                 budget,
                 list,
+                output_dir,
             } => {
-                run_download(&model, quant.as_deref(), budget, list, &overrides);
+                run_download(
+                    &model,
+                    quant.as_deref(),
+                    budget,
+                    list,
+                    output_dir.as_deref(),
+                    &overrides,
+                );
             }
 
             Commands::HfSearch { query, limit } => {
@@ -1959,13 +2050,15 @@ fn main() {
         return;
     }
 
-    // If --cli or --json flag, use classic fit output
-    if cli.cli || cli.json {
+    // If --cli, --json, or --csv flag, use classic fit output
+    if cli.cli || cli.json || cli.csv {
         run_fit(
             cli.perfect,
+            cli.tool_use,
             cli.limit,
             cli.sort.into(),
             cli.json,
+            cli.csv,
             &overrides,
             context_limit,
         );
@@ -2012,6 +2105,10 @@ mod tests {
                 head_dim: None,
                 attention_layout: None,
                 license: None,
+                hidden_size: None,
+                moe_intermediate_size: None,
+                vocab_size: None,
+                shared_expert_intermediate_size: None,
             },
             fit_level,
             run_mode: RunMode::Gpu,
@@ -2032,6 +2129,7 @@ mod tests {
             use_case: llmfit_core::models::UseCase::General,
             runtime: InferenceRuntime::LlamaCpp,
             installed: false,
+            fits_with_turboquant: false,
         }
     }
 
@@ -2091,6 +2189,10 @@ mod tests {
                 head_dim: None,
                 attention_layout: None,
                 license: None,
+                hidden_size: None,
+                moe_intermediate_size: None,
+                vocab_size: None,
+                shared_expert_intermediate_size: None,
             },
             LlmModel {
                 name: "Qwen/Qwen3-Coder-Next".to_string(),
@@ -2117,6 +2219,10 @@ mod tests {
                 head_dim: None,
                 attention_layout: None,
                 license: None,
+                hidden_size: None,
+                moe_intermediate_size: None,
+                vocab_size: None,
+                shared_expert_intermediate_size: None,
             },
         ];
 

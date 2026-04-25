@@ -161,19 +161,26 @@ impl SystemSpecs {
         // These share the full system RAM between CPU and GPU, like Apple Silicon.
         // WMI AdapterRAM is a 32-bit field capped at ~4 GB, so we override with
         // total system RAM for these APUs.
+        //
+        // On Windows, BIOS GPU UMA carveouts cause sysinfo to report only the
+        // CPU-accessible portion (e.g. 32 GB on a 128 GB system where 96 GB is
+        // allocated to the GPU). Query total physical DIMM capacity via
+        // Win32_PhysicalMemory, which reads SMBIOS and is unaffected by the
+        // carveout, so model fit estimates reflect the full memory pool.
         if is_amd_unified_memory_apu(cpu_name) {
+            let apu_pool_gb = detect_windows_physical_total_ram_gb().unwrap_or(total_ram_gb);
             let amd_idx = gpus.iter().position(|g| {
                 let lower = g.name.to_lowercase();
                 lower.contains("amd") || lower.contains("radeon")
             });
             if let Some(idx) = amd_idx {
                 gpus[idx].unified_memory = true;
-                gpus[idx].vram_gb = Some(total_ram_gb);
+                gpus[idx].vram_gb = Some(apu_pool_gb);
             } else {
                 // No AMD GPU found via other methods; create one.
                 gpus.push(GpuInfo {
                     name: format!("{} (integrated)", cpu_name),
-                    vram_gb: Some(total_ram_gb),
+                    vram_gb: Some(apu_pool_gb),
                     backend: GpuBackend::Vulkan,
                     count: 1,
                     unified_memory: true,
@@ -242,6 +249,12 @@ impl SystemSpecs {
                 gpus.push(vulkan_gpu);
             }
         }
+
+        // When both discrete and integrated GPUs are present, drop the
+        // integrated GPUs so the discrete GPU becomes primary. This applies
+        // globally, not just to the Windows WMI path, to handle cases where
+        // an iGPU is detected via Vulkan or APU detection alongside a dGPU.
+        gpus = Self::prefer_discrete_gpus(gpus);
 
         // Sort by VRAM descending so the best GPU is primary
         gpus.sort_by(|a, b| {
@@ -581,15 +594,18 @@ impl SystemSpecs {
                 }
             })
             .and_then(|text| {
-                // Look for "Card Series" or "Card Model" lines
+                // Look for "Card Series" or "Card Model" lines.
+                // rocm-smi output format: "GPU[0] : Card Series: <GPU name>"
+                // The GPU name is after the LAST colon, not the first.
                 for line in text.lines() {
                     let lower = line.to_lowercase();
-                    if (lower.contains("card series") || lower.contains("card model"))
-                        && let Some(val) = line.split(':').nth(1)
-                    {
-                        let name = val.trim().to_string();
-                        if !name.is_empty() {
-                            return Some(name);
+                    if lower.contains("card series") || lower.contains("card model") {
+                        // Take the last colon-separated segment — that's the actual GPU name
+                        if let Some(name) = line.rsplit(':').next() {
+                            let name = name.trim().to_string();
+                            if !name.is_empty() {
+                                return Some(name);
+                            }
                         }
                     }
                 }
@@ -945,6 +961,11 @@ impl SystemSpecs {
     fn is_integrated_gpu_name(name: &str) -> bool {
         let lower = name.to_lowercase();
 
+        // Explicitly tagged as integrated (e.g. from APU detection path)
+        if lower.contains("(integrated)") {
+            return true;
+        }
+
         // Intel integrated: UHD, HD Graphics, Iris (but NOT Intel Arc discrete)
         if lower.contains("intel") {
             return lower.contains("uhd")
@@ -1158,8 +1179,54 @@ impl SystemSpecs {
     }
 
     fn is_same_gpu_name(existing_name: &str, candidate_name: &str) -> bool {
-        Self::normalize_gpu_name_for_dedupe(existing_name)
+        if Self::normalize_gpu_name_for_dedupe(existing_name)
             == Self::normalize_gpu_name_for_dedupe(candidate_name)
+        {
+            return true;
+        }
+
+        // ROCm reports AMD GPUs using a generic family name that lists multiple
+        // model variants separated by "/" (e.g. "Radeon RX 7700S/7600/7600S/7600M
+        // XT/PRO W7600"), while Vulkan/RADV reports the specific model with a
+        // driver codename suffix (e.g. "AMD Radeon RX 7600 XT (RADV NAVI33)").
+        // These refer to the same physical GPU but never match via exact
+        // normalization, so we do a secondary check: if both names contain "amd"
+        // or "radeon" and share at least one 3-5 digit model number, treat them
+        // as the same device.
+        let e_lower = existing_name.to_lowercase();
+        let c_lower = candidate_name.to_lowercase();
+        let is_amd = |s: &str| s.contains("radeon") || s.starts_with("amd ") || s.contains(" amd ");
+        if is_amd(&e_lower) && is_amd(&c_lower) {
+            let e_nums = Self::extract_gpu_model_numbers(&e_lower);
+            let c_nums = Self::extract_gpu_model_numbers(&c_lower);
+            if !e_nums.is_empty() && e_nums.iter().any(|n| c_nums.contains(n)) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Extract 3-5 digit numeric tokens from a GPU name (e.g. "7600", "6800").
+    /// Used to compare AMD family names from ROCm against specific model names
+    /// from Vulkan/RADV for deduplication.
+    fn extract_gpu_model_numbers(name: &str) -> Vec<String> {
+        let mut numbers = Vec::new();
+        let mut current = String::new();
+        for c in name.chars() {
+            if c.is_ascii_digit() {
+                current.push(c);
+            } else {
+                if current.len() >= 3 && current.len() <= 5 {
+                    numbers.push(current.clone());
+                }
+                current.clear();
+            }
+        }
+        if current.len() >= 3 && current.len() <= 5 {
+            numbers.push(current);
+        }
+        numbers
     }
 
     fn normalize_gpu_name_for_dedupe(name: &str) -> String {
@@ -1626,15 +1693,52 @@ fn detect_running_in_wsl() -> bool {
 /// All Ryzen AI APUs have integrated Radeon GPUs that share system memory.
 fn is_amd_unified_memory_apu(cpu_name: &str) -> bool {
     let lower = cpu_name.to_lowercase();
-    // All "Ryzen AI" branded APUs use unified/shared memory.
-    // Examples:
+    // Only "Ryzen AI MAX" / "Ryzen AI MAX+" APUs have a large unified memory
+    // pool shared between CPU and GPU (similar to Apple Silicon).
+    // Regular Ryzen AI chips (e.g. HX 370, HX 365) have a standard small iGPU
+    // and should NOT be treated as unified-memory systems.
+    // Examples that match:
     //   "AMD Ryzen AI MAX+ 395 w/ Radeon 8060S"
-    //   "AMD Ryzen AI 9 HX 370 w/ Radeon 890M"
-    //   "AMD Ryzen AI 7 350"
-    if lower.contains("ryzen ai") {
+    //   "AMD Ryzen AI MAX 390"
+    if lower.contains("ryzen ai max") {
         return true;
     }
     false
+}
+
+/// Query total installed physical RAM on Windows by summing DIMM capacities
+/// from WMI `Win32_PhysicalMemory`. Unlike `sysinfo::System::total_memory()`
+/// or `Win32_ComputerSystem.TotalPhysicalMemory`, this reads directly from
+/// SMBIOS and is unaffected by BIOS-level GPU UMA carveouts.
+///
+/// On AMD Ryzen AI MAX / MAX+ systems where users configure e.g. 96 GB as GPU
+/// UMA in BIOS, the OS only sees the remaining ~32 GB as system RAM, causing
+/// `sysinfo` to report 32 GB. `Win32_PhysicalMemory.Capacity` correctly sums
+/// all installed DIMMs (e.g. 128 GB) regardless of that carveout.
+///
+/// Returns `None` when not on Windows, PowerShell is unavailable, or the
+/// query fails; callers fall back to the sysinfo value.
+fn detect_windows_physical_total_ram_gb() -> Option<f64> {
+    if !cfg!(target_os = "windows") {
+        return None;
+    }
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum).Sum",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let bytes: u64 = text.trim().parse().ok()?;
+    if bytes == 0 {
+        return None;
+    }
+    Some(bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
 /// Read total system RAM from /proc/meminfo (Linux only).
@@ -2540,6 +2644,46 @@ GPU id = 1 (NVIDIA GeForce RTX 4090)
     }
 
     #[test]
+    fn test_is_same_gpu_name_amd_rocm_vs_vulkan_radv() {
+        // ROCm reports a family name listing multiple variants; RADV reports the
+        // specific model with a driver codename.  They should be treated as the
+        // same physical GPU.
+        assert!(SystemSpecs::is_same_gpu_name(
+            "Radeon RX 7700S/7600/7600S/7600M XT/PRO W7600",
+            "AMD Radeon RX 7600 XT (RADV NAVI33)"
+        ));
+        // A 7700 XT via RADV should also match the same ROCm family name.
+        assert!(SystemSpecs::is_same_gpu_name(
+            "Radeon RX 7700S/7600/7600S/7600M XT/PRO W7600",
+            "AMD Radeon RX 7700 XT (RADV NAVI33)"
+        ));
+        // Non-AMD GPUs must not be affected.
+        assert!(!SystemSpecs::is_same_gpu_name(
+            "NVIDIA GeForce RTX 3060",
+            "AMD Radeon RX 6600"
+        ));
+        // Different AMD model numbers must not match.
+        assert!(!SystemSpecs::is_same_gpu_name(
+            "AMD Radeon RX 6600",
+            "AMD Radeon RX 7900 XTX (RADV NAVI31)"
+        ));
+    }
+
+    #[test]
+    fn test_extract_gpu_model_numbers() {
+        assert_eq!(
+            SystemSpecs::extract_gpu_model_numbers("radeon rx 7700s 7600 7600s 7600m xt pro w7600"),
+            vec!["7700", "7600", "7600", "7600", "7600"]
+        );
+        assert_eq!(
+            SystemSpecs::extract_gpu_model_numbers("amd radeon rx 7600 xt radv navi33"),
+            vec!["7600"]
+        );
+        // Numbers shorter than 3 or longer than 5 digits are ignored.
+        assert!(SystemSpecs::extract_gpu_model_numbers("rx 42 xt").is_empty());
+    }
+
+    #[test]
     fn test_normalize_gpu_name_for_dedupe() {
         assert_eq!(
             SystemSpecs::normalize_gpu_name_for_dedupe(" Adreno (TM) 740 "),
@@ -2694,15 +2838,27 @@ GPU id = 1 (NVIDIA GeForce RTX 4090)
 
     #[test]
     fn test_amd_unified_memory_apu_detection() {
+        // Only Ryzen AI MAX / MAX+ have true unified memory
         assert!(super::is_amd_unified_memory_apu(
             "AMD Ryzen AI MAX+ 395 w/ Radeon 8060S"
         ));
-        assert!(super::is_amd_unified_memory_apu(
+        assert!(super::is_amd_unified_memory_apu("AMD Ryzen AI MAX 390"));
+        // Regular Ryzen AI chips are NOT unified memory APUs
+        assert!(!super::is_amd_unified_memory_apu(
             "AMD Ryzen AI 9 HX 370 w/ Radeon 890M"
         ));
-        assert!(super::is_amd_unified_memory_apu("AMD Ryzen AI 7 350"));
+        assert!(!super::is_amd_unified_memory_apu("AMD Ryzen AI 7 350"));
         assert!(!super::is_amd_unified_memory_apu("AMD Ryzen 9 7950X"));
         assert!(!super::is_amd_unified_memory_apu("Intel Core i9-14900K"));
+    }
+
+    // ── detect_windows_physical_total_ram_gb ─────────────────────────
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn test_windows_physical_total_ram_returns_none_on_non_windows() {
+        // On Linux/macOS the function must return None (it is Windows-only).
+        assert!(super::detect_windows_physical_total_ram_gb().is_none());
     }
 
     // ── bandwidth: RTX 20 series ─────────────────────────────────────
@@ -2937,6 +3093,10 @@ GPU id = 1 (NVIDIA GeForce RTX 4090)
         ));
         assert!(!SystemSpecs::is_integrated_gpu_name(
             "Intel(R) Arc(TM) B580"
+        ));
+        // Explicit "(integrated)" tag from APU detection
+        assert!(SystemSpecs::is_integrated_gpu_name(
+            "AMD Ryzen AI 9 HX 370 w/ Radeon 890M (integrated)"
         ));
     }
 
