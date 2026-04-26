@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
 use colored::*;
 use llmfit_core::fit::{FitLevel, ModelFit, RunMode, SortColumn};
 use llmfit_core::hardware::SystemSpecs;
@@ -508,13 +511,13 @@ pub fn display_json_fits_with_llamacpp(specs: &SystemSpecs, fits: &[ModelFit]) {
             let mut json = fit_to_json(fit);
 
             // Add suggested llama.cpp command for llama.cpp-compatible models
-            if fit.runtime == InferenceRuntime::LlamaCpp {
-                if let Some(cmd) = generate_llamacpp_command(fit) {
-                    json.as_object_mut().unwrap().insert(
-                        "llamacpp_command".to_string(),
-                        serde_json::Value::String(cmd),
-                    );
-                }
+            if fit.runtime == InferenceRuntime::LlamaCpp
+                && let Some(cmd) = generate_llamacpp_command(fit)
+            {
+                json.as_object_mut().unwrap().insert(
+                    "llamacpp_command".to_string(),
+                    serde_json::Value::String(cmd),
+                );
             }
 
             json
@@ -553,30 +556,74 @@ fn generate_llamacpp_command(fit: &ModelFit) -> Option<String> {
     // downloading/caching. This avoids path guessing issues and works for both
     // installed and non-installed models. llama-cli automatically downloads
     // to its own cache if the model isn't present locally.
-    if let Some(repo) = repo {
-        // Format: llama-cli -hf repo/name:QuantLevel <offload args> -c context [-cnv]
-        // The :QuantLevel suffix tells llama-cli which quantization file to use
-        Some(format!(
+    repo.map(|repo| {
+        format!(
             "llama-cli -hf {}:{} {} -c {}{}",
             repo, quant, ngl_args, context, conversation_arg
-        ))
-    } else {
-        None
-    }
+        )
+    })
 }
 
 fn llamacpp_ngl_args(run_mode: RunMode) -> Option<&'static str> {
     match run_mode {
+        RunMode::CpuOffload | RunMode::MoeOffload => {
+            llamacpp_ngl_args_for_support(run_mode, llamacpp_supports_fit_arg())
+        }
+        _ => llamacpp_ngl_args_for_support(run_mode, false),
+    }
+}
+
+fn llamacpp_ngl_args_for_support(
+    run_mode: RunMode,
+    supports_fit_arg: bool,
+) -> Option<&'static str> {
+    match run_mode {
         RunMode::Gpu => Some("-ngl all"),
         RunMode::CpuOnly => Some("-ngl 0"),
-        RunMode::CpuOffload => Some("-ngl auto --fit on"),
+        RunMode::CpuOffload => Some(if supports_fit_arg {
+            "-ngl auto --fit on"
+        } else {
+            "-ngl auto"
+        }),
         // llmfit's MoE estimate is not an exact llama.cpp layer/MoE split, so
         // prefer llama.cpp's fit-aware auto offload rather than forcing --cpu-moe.
-        RunMode::MoeOffload => Some("-ngl auto --fit on"),
+        RunMode::MoeOffload => Some(if supports_fit_arg {
+            "-ngl auto --fit on"
+        } else {
+            "-ngl auto"
+        }),
         RunMode::TensorParallel => None,
     }
 }
 
+fn llamacpp_supports_fit_arg() -> bool {
+    static SUPPORTS_FIT_ARG: OnceLock<bool> = OnceLock::new();
+
+    *SUPPORTS_FIT_ARG.get_or_init(|| {
+        let candidate = llamacpp_binary_arg();
+        let Ok(output) = std::process::Command::new(&candidate).arg("--help").output() else {
+            return false;
+        };
+
+        String::from_utf8_lossy(&output.stdout).contains("--fit")
+            || String::from_utf8_lossy(&output.stderr).contains("--fit")
+    })
+}
+
+fn llamacpp_binary_arg() -> PathBuf {
+    let name = format!("llama-cli{}", std::env::consts::EXE_SUFFIX);
+    if let Ok(dir) = std::env::var("LLAMA_CPP_PATH") {
+        let candidate = PathBuf::from(dir).join(&name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(name)
+}
+
+/// Best-effort heuristic: checks use_case and name substrings to guess whether
+/// a model is conversational. May misfire on edge cases (e.g. an embedding model
+/// named "multichat", or a general-purpose model named "functionary").
 fn should_use_llamacpp_conversation_mode(fit: &ModelFit) -> bool {
     use llmfit_core::models::{Capability, UseCase};
 
@@ -931,11 +978,11 @@ mod tests {
             },
             estimated_tps: 30.0,
             best_quant: "Q4_K_M".to_string(),
-            effective_context_length: 8_192,
             use_case,
             runtime: InferenceRuntime::LlamaCpp,
             installed: false,
             fits_with_turboquant: false,
+            effective_context_length: 8_192,
         }
     }
 
@@ -960,13 +1007,23 @@ mod tests {
     }
 
     #[test]
-    fn llamacpp_command_uses_auto_fit_for_cpu_offload() {
-        let fit = mock_fit(RunMode::CpuOffload, UseCase::General, "general");
-
-        let command = generate_llamacpp_command(&fit).expect("expected command");
-
-        assert!(command.contains("-ngl auto --fit on"));
-        assert!(!command.contains("-ngl all"));
+    fn llamacpp_offload_ngl_args_use_fit_only_when_supported() {
+        assert_eq!(
+            llamacpp_ngl_args_for_support(RunMode::CpuOffload, true),
+            Some("-ngl auto --fit on")
+        );
+        assert_eq!(
+            llamacpp_ngl_args_for_support(RunMode::CpuOffload, false),
+            Some("-ngl auto")
+        );
+        assert_eq!(
+            llamacpp_ngl_args_for_support(RunMode::MoeOffload, true),
+            Some("-ngl auto --fit on")
+        );
+        assert_eq!(
+            llamacpp_ngl_args_for_support(RunMode::MoeOffload, false),
+            Some("-ngl auto")
+        );
     }
 
     #[test]

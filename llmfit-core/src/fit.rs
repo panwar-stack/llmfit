@@ -212,11 +212,11 @@ pub struct ModelFit {
     pub score_components: ScoreComponents,
     pub estimated_tps: f64,            // baseline estimated tokens per second
     pub best_quant: String,            // best quantization for this hardware
-    pub effective_context_length: u32, // context length used for memory estimation
     pub use_case: UseCase,             // inferred use case category
     pub runtime: InferenceRuntime,     // inference runtime (MLX or llama.cpp)
     pub installed: bool,               // model found in a local runtime provider
     pub fits_with_turboquant: bool,    // TooTight at fp16 KV but fits with TurboQuant KV
+    pub effective_context_length: u32, // context length used for memory estimation
 }
 
 impl ModelFit {
@@ -547,11 +547,11 @@ impl ModelFit {
             score_components,
             estimated_tps,
             best_quant: best_quant_str,
-            effective_context_length: estimation_ctx,
             use_case,
             runtime,
             installed: false, // set later by App after provider detection
             fits_with_turboquant,
+            effective_context_length: estimation_ctx,
         }
     }
 

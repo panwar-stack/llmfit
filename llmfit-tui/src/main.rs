@@ -2127,11 +2127,11 @@ mod tests {
             },
             estimated_tps: 30.0,
             best_quant: "Q4_K_M".to_string(),
-            effective_context_length: 8192,
             use_case: llmfit_core::models::UseCase::General,
             runtime: InferenceRuntime::LlamaCpp,
             installed: false,
             fits_with_turboquant: false,
+            effective_context_length: 8192,
         }
     }
 
