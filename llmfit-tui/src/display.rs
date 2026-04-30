@@ -601,7 +601,10 @@ fn llamacpp_supports_fit_arg() -> bool {
 
     *SUPPORTS_FIT_ARG.get_or_init(|| {
         let candidate = llamacpp_binary_arg();
-        let Ok(output) = std::process::Command::new(&candidate).arg("--help").output() else {
+        let Ok(output) = std::process::Command::new(&candidate)
+            .arg("--help")
+            .output()
+        else {
             return false;
         };
 

@@ -1754,8 +1754,8 @@ fn run_model(model: &str, server: bool, port: u16, ngl: i32, ctx_size: u32) {
                 &ngl.to_string(),
                 "-c",
                 &ctx_size.to_string(),
-        ])
-        .status();
+            ])
+            .status();
 
         match status {
             Ok(s) if !s.success() => {
